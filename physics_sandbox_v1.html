@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>物理沙盒 Demo v1.1</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body, html {
+      width: 100%; height: 100%;
+      overflow: hidden; background: #111827;
+      font-family: system-ui, -apple-system, sans-serif;
+      touch-action: none; user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #gameCanvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+    #ui-layer {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; display: flex; flex-direction: column;
+    }
+    #hud {
+      padding: 12px 16px; color: #e5e7eb;
+      display: flex; justify-content: space-between; align-items: center;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent);
+      pointer-events: auto;
+    }
+    .btn {
+      background: #3b82f6; color: #fff; border: none; padding: 8px 14px;
+      border-radius: 6px; font-size: 14px; cursor: pointer; transition: 0.2s;
+    }
+    .btn:hover { background: #2563eb; }
+    .btn:active { transform: scale(0.96); }
+    
+    .overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.85); display: flex; flex-direction: column;
+      justify-content: center; align-items: center; pointer-events: auto;
+      transition: opacity 0.3s;
+    }
+    .hidden { opacity: 0; pointer-events: none; }
+    .overlay h1 { color: #fff; font-size: 2.2rem; margin-bottom: 12px; text-align: center; }
+    .overlay p { color: #9ca3af; margin-bottom: 24px; text-align: center; max-width: 80%; line-height: 1.5; }
+    .overlay .btn { font-size: 1.1rem; padding: 12px 28px; }
+    #end-screen h1 { color: #f87171; }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  
+  <div id="ui-layer">
+    <div id="hud">
+      <span>⚛️ 得分: <span id="score-val">0</span> | 📦 數量: <span id="count-val">0</span></span>
+      <button id="reset-btn" class="btn">🔄 重置 (R)</button>
+    </div>
+  </div>
+
+  <div id="start-screen" class="overlay">
+    <h1>⚛️ 物理沙盒 Demo v1.1</h1>
+    <p>點擊生成隨機大小與質量的物體<br>體驗重力、邊界彈跳與真實動量碰撞</p>
+    <button id="start-btn" class="btn">▶️ 開始遊玩</button>
+  </div>
+
+  <div id="end-screen" class="overlay hidden">
+    <h1>🏁 物件達上限！</h1>
+    <p>為維持 60fps 效能，已暫停生成。<br>總計生成: <span id="final-score">0</span> 個</p>
+    <button id="restart-btn" class="btn">🔄 重新開始</button>
+  </div>
+
+  <script>
+    // ================= CONFIG =================
+    const CONFIG = {
+      GRAVITY: 850,
+      DAMPING: 0.7,        // 邊界碰撞阻尼
+      FRICTION: 0.99,      // 空氣摩擦
+      MAX_BALLS: 50,
+      RADIUS_MIN: 12,
+      RADIUS_MAX: 26,
+      TRAIL_LENGTH: 6
+    };
+
+    // ================= STATE =================
+    const state = {
+      isRunning: false,
+      isPaused: false,
+      balls: [],
+      score: 0,
+      lastTime: 0
+    };
+
+    // ================= DOM REFs =================
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const scoreVal = document.getElementById('score-val');
+    const countVal = document.getElementById('count-val');
+    const startScreen = document.getElementById('start-screen');
+    const endScreen = document.getElementById('end-screen');
+    const finalScore = document.getElementById('final-score');
+
+    // ================= CANVAS SETUP =================
+    function resizeCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.parentElement.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.scale(dpr, dpr);
+      canvas.logicWidth = rect.width;
+      canvas.logicHeight = rect.height;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // ================= CLASS: BALL =================
+    class Ball {
+      constructor(x, y) {
+        this.x = x;
+        this.y = y;
+        this.r = CONFIG.RADIUS_MIN + Math.random() * (CONFIG.RADIUS_MAX - CONFIG.RADIUS_MIN);
+        this.mass = this.r * this.r; // 質量與面積成正比
+        this.vx = (Math.random() * 400 - 200);
+        this.vy = (Math.random() * 100 - 50);
+        this.color = `hsl(${Math.random() * 360}, 75%, 60%)`;
+        this.trail = []; // 拖影歷史座標
+      }
+
+      update(dt) {
+        // 記錄拖影
+        this.trail.push({x: this.x, y: this.y});
+        if (this.trail.length > CONFIG.TRAIL_LENGTH) this.trail.shift();
+
+        // 物理積分
+        this.vy += CONFIG.GRAVITY * dt;
+        this.vx *= CONFIG.FRICTION;
+        this.vy *= CONFIG.FRICTION;
+
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+
+        // 邊界修正與彈跳
+        const w = canvas.logicWidth;
+        const h = canvas.logicHeight;
+
+        if (this.y + this.r > h) { this.y = h - this.r; this.vy *= -CONFIG.DAMPING; }
+        if (this.y - this.r < 0) { this.y = this.r; this.vy *= -CONFIG.DAMPING; }
+        if (this.x - this.r < 0) { this.x = this.r; this.vx *= -CONFIG.DAMPING; }
+        if (this.x + this.r > w) { this.x = w - this.r; this.vx *= -CONFIG.DAMPING; }
+      }
+
+      draw(ctx) {
+        // 繪製拖影
+        for (let i = 0; i < this.trail.length; i++) {
+          const t = this.trail[i];
+          const ratio = i / this.trail.length;
+          ctx.beginPath();
+          ctx.arc(t.x, t.y, this.r * ratio, 0, Math.PI * 2);
+          ctx.fillStyle = this.color;
+          ctx.globalAlpha = 0.2 * ratio;
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1.0; // 重置透明度
+
+        // 繪製主體
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+        ctx.fillStyle = this.color;
+        ctx.fill();
+
+        // 高光
+        ctx.beginPath();
+        ctx.arc(this.x - this.r * 0.3, this.y - this.r * 0.3, this.r * 0.25, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.4)';
+        ctx.fill();
+      }
+    }
+
+    // ================= PHYSICS: COLLISION =================
+    function resolveCollisions(balls) {
+      const len = balls.length;
+      for (let i = 0; i < len; i++) {
+        for (let j = i + 1; j < len; j++) {
+          const b1 = balls[i], b2 = balls[j];
+          const dx = b2.x - b1.x;
+          const dy = b2.y - b1.y;
+          const dist = Math.hypot(dx, dy);
+          const minDist = b1.r + b2.r;
+
+          if (dist < minDist && dist > 0.01) {
+            // 1. 法線向量
+            const nx = dx / dist;
+            const ny = dy / dist;
+
+            // 2. 位置修正 (防重疊穿透)
+            const overlap = (minDist - dist) / 2;
+            b1.x -= nx * overlap;
+            b1.y -= ny * overlap;
+            b2.x += nx * overlap;
+            b2.y += ny * overlap;
+
+            // 3. 相對速度法線分量
+            const v1n = b1.vx * nx + b1.vy * ny;
+            const v2n = b2.vx * nx + b2.vy * ny;
+
+            // 若正在分離則忽略
+            if (v2n - v1n < 0) continue;
+
+            // 4. 2D 彈性碰撞 (動量守恒)
+            const m1 = b1.mass, m2 = b2.mass;
+            const totalMass = m1 + m2;
+            const newV1n = (v1n * (m1 - m2) + 2 * m2 * v2n) / totalMass;
+            const newV2n = (v2n * (m2 - m1) + 2 * m1 * v1n) / totalMass;
+
+            // 5. 切線分量 (保持不變)
+            const tx = -ny, ty = nx;
+            const v1t = b1.vx * tx + b1.vy * ty;
+            const v2t = b2.vx * tx + b2.vy * ty;
+
+            // 6. 重建速度向量
+            b1.vx = v1t * tx + newV1n * nx;
+            b1.vy = v1t * ty + newV1n * ny;
+            b2.vx = v2t * tx + newV2n * nx;
+            b2.vy = v2t * ty + newV2n * ny;
+          }
+        }
+      }
+    }
+
+    // ================= GAME LOGIC =================
+    function spawnBall(x, y) {
+      if (!state.isRunning || state.isPaused) return;
+      if (state.balls.length >= CONFIG.MAX_BALLS) {
+        triggerEnd();
+        return;
+      }
+      const b = new Ball(x, y);
+      state.balls.push(b);
+      state.score++;
+      updateHUD();
+      resolveCollisions(state.balls); // 立即解算新生成物體的重疊
+    }
+
+    function resetGame() {
+      state.balls = [];
+      state.score = 0;
+      state.isPaused = false;
+      updateHUD();
+      if (!state.isRunning) return;
+      endScreen.classList.add('hidden');
+    }
+
+    function triggerEnd() {
+      state.isRunning = false;
+      finalScore.textContent = state.score;
+      endScreen.classList.remove('hidden');
+    }
+
+    function updateHUD() {
+      scoreVal.textContent = state.score;
+      countVal.textContent = state.balls.length;
+    }
+
+    function gameLoop(timestamp) {
+      if (!state.lastTime) state.lastTime = timestamp;
+      let dt = (timestamp - state.lastTime) / 1000;
+      state.lastTime = timestamp;
+      dt = Math.min(dt, 0.05); // 防卡頓跳幀
+
+      ctx.clearRect(0, 0, canvas.logicWidth, canvas.logicHeight);
+
+      if (state.isRunning && !state.isPaused) {
+        for (const b of state.balls) b.update(dt);
+        resolveCollisions(state.balls);
+      }
+
+      for (const b of state.balls) b.draw(ctx);
+      requestAnimationFrame(gameLoop);
+    }
+
+    // ================= INPUT =================
+    canvas.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      spawnBall(e.clientX - rect.left, e.clientY - rect.top);
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') { e.preventDefault(); state.isPaused = !state.isPaused; }
+      if (e.code === 'KeyR') resetGame();
+    });
+
+    document.getElementById('reset-btn').addEventListener('click', resetGame);
+    document.getElementById('start-btn').addEventListener('click', () => { state.isRunning = true; startScreen.classList.add('hidden'); });
+    document.getElementById('restart-btn').addEventListener('click', () => { resetGame(); state.isRunning = true; });
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    // ================= INIT =================
+    requestAnimationFrame(gameLoop);
+    updateHUD();
+  </script>
+</body>
+</html>

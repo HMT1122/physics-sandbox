@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>物理沙盒 Demo v1.2</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body, html {
+      width: 100%; height: 100%;
+      overflow: hidden; background: #0f172a;
+      font-family: system-ui, -apple-system, sans-serif;
+      touch-action: none; user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #gameCanvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+    #ui-layer {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; display: flex; flex-direction: column;
+    }
+    #hud {
+      padding: 12px 16px; color: #e2e8f0;
+      display: flex; justify-content: space-between; align-items: center;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
+      pointer-events: auto; font-size: 14px;
+    }
+    .btn {
+      background: #3b82f6; color: #fff; border: none; padding: 8px 14px;
+      border-radius: 6px; font-size: 14px; cursor: pointer; transition: 0.2s;
+    }
+    .btn:hover { background: #2563eb; }
+    .btn:active { transform: scale(0.96); }
+    
+    .overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.9); display: flex; flex-direction: column;
+      justify-content: center; align-items: center; pointer-events: auto;
+      transition: opacity 0.3s;
+    }
+    .hidden { opacity: 0; pointer-events: none; }
+    .overlay h1 { color: #fff; font-size: 2rem; margin-bottom: 12px; text-align: center; }
+    .overlay p { color: #94a3b8; margin-bottom: 24px; text-align: center; max-width: 85%; line-height: 1.5; }
+    .overlay .btn { font-size: 1.1rem; padding: 12px 28px; }
+    #end-screen h1 { color: #f87171; }
+    
+    /* FPS 指示器 */
+    #fps { 
+      background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 4px; 
+      font-family: monospace; font-size: 12px; 
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  
+  <div id="ui-layer">
+    <div id="hud">
+      <span>⚛️ 得分: <span id="score-val">0</span> | 📦 <span id="count-val">0</span> | 🎯 <span id="fps">FPS: --</span></span>
+      <button id="reset-btn" class="btn">🔄 重置 (R)</button>
+    </div>
+  </div>
+
+  <div id="start-screen" class="overlay">
+    <h1>⚛️ 物理沙盒 Demo v1.2</h1>
+    <p>✨ 新增：碰撞音效 + 粒子特效 + 100+ 物件流暢模擬</p>
+    <button id="start-btn" class="btn">▶️ 開始遊玩</button>
+  </div>
+
+  <div id="end-screen" class="overlay hidden">
+    <h1>🏁 物件達上限！</h1>
+    <p>為維持 60fps，已暫停生成。<br>總計生成: <span id="final-score">0</span> 個</p>
+    <button id="restart-btn" class="btn">🔄 重新開始</button>
+  </div>
+
+  <script>
+    // ================= CONFIG =================
+    const CONFIG = {
+      GRAVITY: 800,
+      DAMPING: 0.65,
+      FRICTION: 0.995,
+      MAX_BALLS: 100,          // Iter3: 上限提升至 100
+      RADIUS_MIN: 10,
+      RADIUS_MAX: 28,
+      TRAIL_LENGTH: 5,
+      SLEEP_THRESHOLD: 0.08,   // 速度低於此值且在地面持續 30 幀則 sleep
+      SLEEP_FRAMES: 30,
+      GRID_CELL: 60,           // 網格大小 (>= RADIUS_MAX*2)
+      PARTICLE_COUNT: 4,       // 碰撞粒子數
+      PARTICLE_LIFE: 12        // 粒子存活幀數
+    };
+
+    // ================= STATE =================
+    const state = {
+      isRunning: false,
+      isPaused: false,
+      balls: [],
+      particles: [],
+      score: 0,
+      lastTime: 0,
+      fps: 0,
+      frameCount: 0,
+      fpsLastTime: 0
+    };
+
+    // ================= AUDIO =================
+    let audioCtx = null;
+    function initAudio() {
+      if (!audioCtx) {
+        try {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch (e) {
+          console.warn('Web Audio not supported');
+        }
+      }
+      if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(() => {});
+      }
+    }
+
+    function playCollisionSound(impact) {
+      if (!audioCtx) return;
+      const vol = Math.min(0.4, impact * 0.8);
+      const freq = 200 + impact * 600;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+      gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.08);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.08);
+    }
+
+    // ================= DOM REFs =================
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const scoreVal = document.getElementById('score-val');
+    const countVal = document.getElementById('count-val');
+    const fpsVal = document.getElementById('fps');
+    const startScreen = document.getElementById('start-screen');
+    const endScreen = document.getElementById('end-screen');
+    const finalScore = document.getElementById('final-score');
+
+    // ================= CANVAS SETUP =================
+    function resizeCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.parentElement.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.scale(dpr, dpr);
+      canvas.logicWidth = rect.width;
+      canvas.logicHeight = rect.height;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // ================= CLASS: BALL =================
+    class Ball {
+      constructor(x, y) {
+        this.x = x;
+        this.y = y;
+        this.r = CONFIG.RADIUS_MIN + Math.random() * (CONFIG.RADIUS_MAX - CONFIG.RADIUS_MIN);
+        this.mass = this.r * this.r;
+        this.vx = (Math.random() * 400 - 200);
+        this.vy = (Math.random() * 100 - 50);
+        this.color = `hsl(${Math.random() * 360}, 75%, 60%)`;
+        this.trail = [];
+        this.isSleeping = false;
+        this.sleepCounter = 0;
+        this.scale = 1; // 撞擊縮放回饋
+      }
+
+      wakeUp() {
+        if (this.isSleeping) {
+          this.isSleeping = false;
+          this.sleepCounter = 0;
+        }
+      }
+
+      update(dt) {
+        if (this.isSleeping) return;
+
+        // 拖影
+        this.trail.push({x: this.x, y: this.y});
+        if (this.trail.length > CONFIG.TRAIL_LENGTH) this.trail.shift();
+
+        // 物理積分
+        this.vy += CONFIG.GRAVITY * dt;
+        this.vx *= CONFIG.FRICTION;
+        this.vy *= CONFIG.FRICTION;
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+
+        // 邊界碰撞
+        const w = canvas.logicWidth, h = canvas.logicHeight;
+        let bounced = false;
+        if (this.y + this.r > h) { this.y = h - this.r; this.vy *= -CONFIG.DAMPING; bounced = true; }
+        if (this.y - this.r < 0) { this.y = this.r; this.vy *= -CONFIG.DAMPING; bounced = true; }
+        if (this.x - this.r < 0) { this.x = this.r; this.vx *= -CONFIG.DAMPING; bounced = true; }
+        if (this.x + this.r > w) { this.x = w - this.r; this.vx *= -CONFIG.DAMPING; bounced = true; }
+
+        // Sleep 判斷：速度極低 + 在地面 + 無碰撞
+        const speed = Math.abs(this.vx) + Math.abs(this.vy);
+        const onGround = (this.y + this.r >= h - 0.5);
+        if (speed < CONFIG.SLEEP_THRESHOLD && onGround && !bounced) {
+          this.sleepCounter++;
+          if (this.sleepCounter >= CONFIG.SLEEP_FRAMES) {
+            this.isSleeping = true;
+            this.vx = 0; this.vy = 0; // 完全靜止
+          }
+        } else {
+          this.sleepCounter = 0;
+        }
+
+        // 縮放回饋衰減
+        if (this.scale > 1) {
+          this.scale -= dt * 8;
+          if (this.scale < 1) this.scale = 1;
+        }
+      }
+
+      draw(ctx) {
+        // 拖影
+        for (let i = 0; i < this.trail.length; i++) {
+          const t = this.trail[i];
+          const ratio = i / this.trail.length;
+          ctx.beginPath();
+          ctx.arc(t.x, t.y, this.r * ratio * 0.8, 0, Math.PI * 2);
+          ctx.fillStyle = this.color;
+          ctx.globalAlpha = 0.15 * ratio;
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1.0;
+
+        // 主體（含縮放回饋）
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.scale(this.scale, this.scale);
+        ctx.beginPath();
+        ctx.arc(0, 0, this.r, 0, Math.PI * 2);
+        ctx.fillStyle = this.color;
+        ctx.fill();
+        // 高光
+        ctx.beginPath();
+        ctx.arc(-this.r * 0.3, -this.r * 0.3, this.r * 0.25, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.45)';
+        ctx.fill();
+        ctx.restore();
+      }
+
+      impactFeedback(impact) {
+        this.wakeUp();
+        this.scale = 1 + Math.min(0.25, impact * 0.15);
+        playCollisionSound(impact);
+        spawnParticles(this.x, this.y, this.color, impact);
+      }
+    }
+
+    // ================= PARTICLE SYSTEM =================
+    class Particle {
+      constructor(x, y, color, vx, vy) {
+        this.x = x; this.y = y;
+        this.vx = vx; this.vy = vy;
+        this.r = 2 + Math.random() * 3;
+        this.color = color;
+        this.life = CONFIG.PARTICLE_LIFE;
+        this.alpha = 1;
+      }
+      update(dt) {
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+        this.vy += CONFIG.GRAVITY * 0.3 * dt;
+        this.life -= 1;
+        this.alpha = this.life / CONFIG.PARTICLE_LIFE;
+      }
+      draw(ctx) {
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+        ctx.fillStyle = this.color;
+        ctx.globalAlpha = this.alpha * 0.7;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    function spawnParticles(x, y, color, impact) {
+      for (let i = 0; i < CONFIG.PARTICLE_COUNT; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 100 + impact * 300;
+        const vx = Math.cos(angle) * speed;
+        const vy = Math.sin(angle) * speed;
+        state.particles.push(new Particle(x, y, color, vx, vy));
+      }
+    }
+
+    // ================= GRID HASHING =================
+    function buildGrid(balls) {
+      const grid = new Map();
+      const cell = CONFIG.GRID_CELL;
+      for (const b of balls) {
+        if (b.isSleeping) continue; // 忽略 sleep 物體
+        const cx = Math.floor(b.x / cell);
+        const cy = Math.floor(b.y / cell);
+        const key = `${cx},${cy}`;
+        if (!grid.has(key)) grid.set(key, []);
+        grid.get(key).push(b);
+      }
+      return grid;
+    }
+
+    function getNeighborKeys(cx, cy) {
+      const keys = [];
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          keys.push(`${cx + dx},${cy + dy}`);
+        }
+      }
+      return keys;
+    }
+
+    // ================= PHYSICS: COLLISION =================
+    function resolveCollisions(balls) {
+      const grid = buildGrid(balls);
+      const cell = CONFIG.GRID_CELL;
+      const checked = new Set();
+
+      for (const b of balls) {
+        if (b.isSleeping) continue;
+        const cx = Math.floor(b.x / cell);
+        const cy = Math.floor(b.y / cell);
+        const neighbors = getNeighborKeys(cx, cy);
+
+        for (const key of neighbors) {
+          const group = grid.get(key);
+          if (!group) continue;
+          for (const other of group) {
+            if (b === other) continue;
+            const id = b.x < other.x || (b.x === other.x && b.y < other.y) 
+              ? `${b.x},${b.y},${other.x},${other.y}`
+              : `${other.x},${other.y},${b.x},${b.y}`;
+            if (checked.has(id)) continue;
+            checked.add(id);
+
+            const dx = other.x - b.x;
+            const dy = other.y - b.y;
+            const dist = Math.hypot(dx, dy);
+            const minDist = b.r + other.r;
+
+            if (dist < minDist && dist > 0.01) {
+              const nx = dx / dist, ny = dy / dist;
+              const overlap = (minDist - dist) / 2;
+              b.x -= nx * overlap; b.y -= ny * overlap;
+              other.x += nx * overlap; other.y += ny * overlap;
+
+              const v1n = b.vx * nx + b.vy * ny;
+              const v2n = other.vx * nx + other.vy * ny;
+              if (v2n - v1n < 0) continue;
+
+              const m1 = b.mass, m2 = other.mass;
+              const total = m1 + m2;
+              const newV1n = (v1n * (m1 - m2) + 2 * m2 * v2n) / total;
+              const newV2n = (v2n * (m2 - m1) + 2 * m1 * v1n) / total;
+
+              const tx = -ny, ty = nx;
+              const v1t = b.vx * tx + b.vy * ty;
+              const v2t = other.vx * tx + other.vy * ty;
+
+              b.vx = v1t * tx + newV1n * nx;
+              b.vy = v1t * ty + newV1n * ny;
+              other.vx = v2t * tx + newV2n * nx;
+              other.vy = v2t * ty + newV2n * ny;
+
+              // 喚醒雙方 + 視覺/音效回饋
+              const impact = Math.abs(newV1n - v1n) + Math.abs(newV2n - v2n);
+              b.impactFeedback(impact * 0.5);
+              other.impactFeedback(impact * 0.5);
+            }
+          }
+        }
+      }
+    }
+
+    // ================= GAME LOGIC =================
+    function spawnBall(x, y) {
+      if (!state.isRunning || state.isPaused) return;
+      if (state.balls.length >= CONFIG.MAX_BALLS) {
+        triggerEnd();
+        return;
+      }
+      const b = new Ball(x, y);
+      state.balls.push(b);
+      state.score++;
+      updateHUD();
+      resolveCollisions(state.balls);
+    }
+
+    function resetGame() {
+      state.balls = [];
+      state.particles = [];
+      state.score = 0;
+      state.isPaused = false;
+      updateHUD();
+      if (!state.isRunning) return;
+      endScreen.classList.add('hidden');
+    }
+
+    function triggerEnd() {
+      state.isRunning = false;
+      finalScore.textContent = state.score;
+      endScreen.classList.remove('hidden');
+    }
+
+    function updateHUD() {
+      scoreVal.textContent = state.score;
+      countVal.textContent = state.balls.length;
+    }
+
+    function updateFPS(timestamp) {
+      state.frameCount++;
+      if (timestamp - state.fpsLastTime >= 500) {
+        state.fps = Math.round(state.frameCount * 1000 / (timestamp - state.fpsLastTime));
+        fpsVal.textContent = `FPS: ${state.fps}`;
+        state.frameCount = 0;
+        state.fpsLastTime = timestamp;
+      }
+    }
+
+    function gameLoop(timestamp) {
+      if (!state.lastTime) state.lastTime = timestamp;
+      let dt = (timestamp - state.lastTime) / 1000;
+      state.lastTime = timestamp;
+      dt = Math.min(dt, 0.05);
+
+      ctx.clearRect(0, 0, canvas.logicWidth, canvas.logicHeight);
+
+      if (state.isRunning && !state.isPaused) {
+        for (const b of state.balls) b.update(dt);
+        resolveCollisions(state.balls);
+      }
+
+      // 粒子更新
+      for (let i = state.particles.length - 1; i >= 0; i--) {
+        const p = state.particles[i];
+        p.update(dt);
+        p.draw(ctx);
+        if (p.life <= 0) state.particles.splice(i, 1);
+      }
+
+      for (const b of state.balls) b.draw(ctx);
+      updateFPS(timestamp);
+      requestAnimationFrame(gameLoop);
+    }
+
+    // ================= INPUT =================
+    function handleStart() {
+      initAudio();
+      state.isRunning = true;
+      startScreen.classList.add('hidden');
+    }
+
+    canvas.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      initAudio();
+      const rect = canvas.getBoundingClientRect();
+      spawnBall(e.clientX - rect.left, e.clientY - rect.top);
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') { e.preventDefault(); state.isPaused = !state.isPaused; }
+      if (e.code === 'KeyR') resetGame();
+    });
+
+    document.getElementById('reset-btn').addEventListener('click', resetGame);
+    document.getElementById('start-btn').addEventListener('click', handleStart);
+    document.getElementById('restart-btn').addEventListener('click', () => { resetGame(); state.isRunning = true; });
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    // ================= INIT =================
+    requestAnimationFrame(gameLoop);
+    updateHUD();
+  </script>
+</body>
+</html>
